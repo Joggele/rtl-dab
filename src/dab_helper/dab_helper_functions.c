@@ -1,11 +1,11 @@
 /*
 This file is part of rtl-dab
-trl-dab is free software: you can redistribute it and/or modify
+rtl-dab is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-Foobar is distributed in the hope that it will be useful,
+rtl-dab is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
@@ -71,7 +71,7 @@ uint8_t binary_fault_injection(uint8_t *in,uint32_t len,double p_e) {
 }
 
 
-uint8_t fftw_complex_precision_reduction(fftw_complex *in,uint32_t len,uint32_t precision) {
+uint8_t fftwf_complex_precision_reduction(fftwf_complex *in,uint32_t len,uint32_t precision) {
   
   uint32_t i,b;
   //  printf("%lf\n",in[0][0]);
@@ -81,8 +81,8 @@ uint8_t fftw_complex_precision_reduction(fftw_complex *in,uint32_t len,uint32_t 
 
     for (b=0;b<(52-precision);b++) {
       // unset bits
-      *(uint64_t *)&in[i][0] &= ~((uint64_t)1 << b);
-      *(uint64_t *)&in[i][1] &= ~((uint64_t)1 << b);
+      ((uint32_t*)&in[i])[0] &= ~((uint64_t)1 << b);
+      ((uint32_t*)&in[i])[1] &= ~((uint64_t)1 << b);
     }  
   }
   //printf("%lf\n",in[0][0]);

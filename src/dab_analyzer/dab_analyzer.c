@@ -1,4 +1,5 @@
 #include "dab_analyzer.h"
+#include "dab_helper_functions.h"
 
 void dab_analyzer_init(Analyzer * ana) {
   ana->received_fibs = 0;

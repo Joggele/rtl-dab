@@ -1,11 +1,11 @@
 /*
 This file is part of rtl-dab
-trl-dab is free software: you can redistribute it and/or modify
+rtl-dab is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-Foobar is distributed in the hope that it will be useful,
+rtl-dab is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
@@ -17,285 +17,305 @@ along with rtl-dab.  If not, see <http://www.gnu.org/licenses/>.
 david may 2012
 david.may.muc@googlemail.com
 
+Jörg Siegler 2017   dev dot js at web dot de
+  - float fftwf is sufficient and much faster than double fftw
+  - amplitude independent null symbol detection, SNR calculation
+  - new phase reference symbol processing with combined time/frequency sync
+
 */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 #include "dab_sync.h"
 #include "prs.h"
 
 #define dbg 0
 
-float mag_squared(fftw_complex sample) {
-    float x = sample[0];
-    float y = sample[1];
-    return x * x + y *y;
+float snr2db( const float snr ) { return snr <= 1 ? 0 : 10 * log10(snr); }
+
+void fft(    uint32_t size, fftwf_complex* in, fftwf_complex* out ) {
+  fftwf_plan p = fftwf_plan_dft_1d( size, in, out, FFTW_FORWARD, FFTW_ESTIMATE );
+  fftwf_execute(p);
+  fftwf_destroy_plan(p);
 }
 
-uint32_t dab_coarse_time_sync(int8_t * real, float * filt, uint8_t force_timesync) {
-  int32_t tnull = 2656; // was 2662? why?
-  int32_t j,k;
-
-  // check for energy in fist tnull samples
-  float e=0;
-  float threshold=5000;
-  for (k=0;k<tnull;k+=10)
-    e = e +(float) abs(real[k]);
-#if dbg
-  fprintf(stderr,"Energy over nullsymbol: %f\n",e);
-#endif
-  if (e<threshold && (force_timesync==0))
-    return 0;
-  fprintf(stderr,"Resync\n");
-  // energy was to high so we assume we are not in sync
-  // subsampled filter to detect where the null symbol is
-  for (j=0;j<(196608-tnull)/10;j++)
-    filt[j] = 0;
-  for (j=0;j<196608-tnull;j+=10)
-    for (k=0;k<tnull;k+=10)
-      filt[j/10] = filt[j/10] +(float) abs(real[j+k]);
-
-  // finding the minimum in filtered data gives position of null symbol
-  float minVal=9999999;
-  uint32_t minPos=0;
-  for (j=0;j<(196608-tnull)/10;j++){
-    if (filt[j]<minVal) {
-      minVal = filt[j];
-      minPos = j*10;
-    }
-  }
-  //fprintf(stderr,"calculated position of nullsymbol: %f",minPos*2);
-  return minPos*2;
+void fftInv( uint32_t size, fftwf_complex* in, fftwf_complex* out ) {
+  fftwf_plan p = fftwf_plan_dft_1d( size, in, out, FFTW_BACKWARD, FFTW_ESTIMATE );
+  fftwf_execute(p);
+  fftwf_destroy_plan(p);
 }
 
-
-int32_t dab_fine_time_sync(fftw_complex * frame){
-
-  /* correlation in frequency domain 
-     e.g. J.Cho "PC-based receiver for Eureka-147" 2001
-     e.g. K.Taura "A DAB receiver" 1996
-  */
-  int k;
-#if dbg
-  FILE *fh0;
-  fh0 = fopen("prs_received.dat","w+");
-  for(k=0;k<2552;k++) {
-    fprintf(fh0,"%f\n",(frame[2656+k][0]));
-    fprintf(fh0,"%f\n",(frame[2656+k][1]));
-  }
-  fclose(fh0);
-#endif
-
-
-
-  /* first we have to transfer the receive prs symbol in frequency domain */
-  fftw_complex prs_received_fft[2048];
-  fftw_plan p;
-  p = fftw_plan_dft_1d(2048, &frame[2656+504], &prs_received_fft[0], FFTW_FORWARD, FFTW_ESTIMATE);
-  fftw_execute(p);
-  fftw_destroy_plan(p);
-#if dbg
-  FILE *fh1;
-  fh1 = fopen("prs_received_fft.dat","w+");
-  for(k=0;k<2048;k++) {
-    fprintf(fh1,"%f\n",(prs_received_fft[k][0]));
-    fprintf(fh1,"%f\n",(prs_received_fft[k][1]));
-  }
-  fclose(fh1);
-#endif
-  /* now we build the complex conjugate of the known prs */
-  // 1536 as only the carries are used
-  fftw_complex prs_star[1536];
-  int i;
-  for (i=0;i<1536;i++) {
-    prs_star[i][0] = prs_static[i][0];
-    prs_star[i][1] = -1 *  prs_static[i][1];
-  }
-#if dbg
-  FILE *fh2;
-  fh2 = fopen("prs_star.dat","w+");
-  for(k=0;k<1536;k++) {
-    fprintf(fh2,"%f\n",(prs_star[k][0]));
-    fprintf(fh2,"%f\n",(prs_star[k][1]));
-  }
-  fclose(fh2);
-#endif
-
-
-  /* fftshift the received prs
-     at this point we have to be coarse frequency sync 
-     however we can simply shift the bins */
-  fftw_complex prs_rec_shift[1536];
-  // TODO allow for coarse frequency shift !=0 
-  int32_t cf_shift = 0;
-  // matlab notation (!!!-1)
-  // 769:1536+s
-  //  2:769+s why 2? I dont remember, but peak is very strong
-  for (i=0;i<1536;i++) {
-    if (i<768) {
-      prs_rec_shift[i][0] = prs_received_fft[i+1280][0];
-      prs_rec_shift[i][1] = prs_received_fft[i+1280][1];
-    }
-    if (i>=768) {
-      prs_rec_shift[i][0] = prs_received_fft[i-765][0];
-      prs_rec_shift[i][1] = prs_received_fft[i-765][1];
-
-    }
-  }
-#if dbg
-  FILE *fh3;
-  fh3 = fopen("prs_rec_shift.dat","w+");
-  for(k=0;k<1536;k++) {
-    fprintf(fh3,"%f\n",(prs_rec_shift[k][0]));
-    fprintf(fh3,"%f\n",(prs_rec_shift[k][1]));
-  }
-  fclose(fh3);
-#endif
-
-
-  
-  /* now we convolute both symbols */
-  fftw_complex convoluted_prs[1536];
-  int s;
-  for (s=0;s<1536;s++) {
-    convoluted_prs[s][0] = prs_rec_shift[s][0]*prs_star[s][0]-prs_rec_shift[s][1]*prs_star[s][1];
-    convoluted_prs[s][1] = prs_rec_shift[s][0]*prs_star[s][1]+prs_rec_shift[s][1]*prs_star[s][0];
-  }
-
-  /* and finally we transfer the convolution back into time domain */
-  fftw_complex convoluted_prs_time[1536]; 
-  fftw_plan px;
-  px = fftw_plan_dft_1d(1536, &convoluted_prs[0], &convoluted_prs_time[0], FFTW_BACKWARD, FFTW_ESTIMATE);
-  fftw_execute(px);
-  fftw_destroy_plan(px);
-#if dbg
-  FILE *fh4;
-  fh4 = fopen("convoluted_prs_time.dat","w+");
-  for(k=0;k<1536;k++) {
-    fprintf(fh4,"%f\n",(convoluted_prs_time[k][0]));
-    fprintf(fh4,"%f\n",(convoluted_prs_time[k][1]));
-  }
-  fclose(fh4);
-#endif
-
-  uint32_t maxPos=0;
-  float tempVal = 0;
-  float maxVal=-99999;
-  for (i=0;i<1536;i++) {
-    tempVal = sqrt((convoluted_prs_time[i][0]*convoluted_prs_time[i][0])+(convoluted_prs_time[i][1]*convoluted_prs_time[i][1]));
-    if (tempVal>maxVal) {
+uint32_t peakAmpIndex( uint32_t size, const fftwf_complex* vec ) {
+  uint32_t maxPos = 0;
+  float maxAmp = -1;
+  for( uint32_t i = 0; i < size; ++i ) {
+    const float amp = cabsf( vec[i] );
+    if( amp > maxAmp ) {
       maxPos = i;
-      maxVal = tempVal;
+      maxAmp = amp;
     }
   }
-  
+  return maxPos;
+}
 
+/**
+ * Corrects the frequency offset in [Hz] by multiplying with exp(-2Ipi*df*t*T).
+ * The two TGUARD/2 before and after the TU data samples will also be corrected.
+ * The phase reference symbol start before TGUARD/2 defines the time offset 0.
+ */
+void correctFrequency( dab_state* dab, float df, uint32_t size, const fftwf_complex* in, fftwf_complex* out ) {
+  const float twoPiTdf = -2 * M_PI * df / SAMPLE_RATE;
+  const fftwf_complex* prsStart = dab->frame + TNULL + dab->dt;
+  const uint32_t indexOffset = in - prsStart; // Relative to PRS before GUARD/2.
+  assert( indexOffset < TFRAME );
+  const float phiOffset = twoPiTdf * indexOffset;
+  const fftwf_complex corrStep = CMPLXF( cos(twoPiTdf), sin(twoPiTdf) );
+  fftwf_complex corr = CMPLXF( cos(phiOffset), sin(phiOffset) );
+  for( unsigned int i = 0; i < size; ++i ) {
+    out[i] = in[i] * corr;
+    corr *= corrStep;
+  }
+}
 
+void gnuplot( const char* fn, uint32_t n, const fftwf_complex* ar ) {
 #if dbg
-  fprintf(stderr,"Fine time shift: %d\n",maxPos);
+  FILE* file = fopen( fn,"w+" );
+  fprintf( file, "set border 3 # left + bottom\n" );
+  fprintf( file, "set tics out\n" );
+  fprintf( file, "set xtics nomirror\n" );
+  fprintf( file, "set ytics nomirror\n" );
+  fprintf( file, "set xzeroaxis\n" );
+  fprintf( file, "set xlabel \"time [ms]\"\n" );
+  fprintf( file, "set title \"%s\"\n", "title" );
+  fprintf( file, "set style fill solid 0.2 noborder\n" );
+  fprintf( file, "\n" );
+  fprintf( file, "plot [0:%d] \\\n", n );
+  fprintf( file, "  '-' using 1:2 notitle with lines lc 0 lt 1\n" );
+  for( uint32_t k = 0; k < n; ++k )
+    fprintf(file,"%.2f %.2f\n", (float)k, cabsf(ar[k]) );
+  fprintf( file, "e\n" );
+  fprintf( file, "\npause -1\n" );
+  fclose(file);
 #endif
-  if (maxPos<1536/2) {
-    return maxPos*2+16;
+}
+
+/*
+ * Find the null symbol start using a sliding window over the 1/16 sub-sampled
+ * amplitude. Sets the null symbol start index * 2. Returns 0 if failed.
+ * During the null symbol the signal is off, i.e. TNULL noise.
+ * Compare this noise with TNULL/2 signal before and TNULL/2 signal after.
+ */
+int8_t dab_coarse_time_sync( dab_state* dab ) {
+  const float WEAK_SIG = 4.0f;	// Weak signal amplitude.
+  const float  LOW_SNR = 1.1f;	// Lower SNR threshold.
+  const float HIGH_SNR = 2.0f;	// Upper SNR threshold.
+  const uint32_t DEC = 16;	// Decimation = 1/16 sub-sampling.
+  assert( TNULL % (2*DEC) == 0 );
+
+  gnuplot( "frame.gp", TNULL+2*TS, dab->frame ); // First 3 symbols only
+
+  // Fast coarse check of a matching prior time synchronization.
+  if( dab->force_timesync == 0 ) {
+    const float signal = ( cabsf(dab->frame[TNULL+  DEC])
+			 + cabsf(dab->frame[TNULL+2*DEC])
+			 + cabsf(dab->frame[TNULL+3*DEC])
+			 + cabsf(dab->frame[TNULL+4*DEC]) ) / 4;
+    const float  noise = ( cabsf(dab->frame[TNULL-  DEC])
+			 + cabsf(dab->frame[TNULL-2*DEC])
+			 + cabsf(dab->frame[TNULL-3*DEC])
+			 + cabsf(dab->frame[TNULL-4*DEC]) ) / 4;
+    const float snr = noise > 0 ? signal / noise : 1.0f;
+    if( snr >= HIGH_SNR && signal >= WEAK_SIG ) {
+      dab->dt = 0;
+      dab->snr = snr;
+      dab->signalAmp = signal;
+      return -1; // Fasr check was successful.
+    }
+  }
+
+  // Initialize sliding window with a null symbol stating at index 0.
+  float amp[TFRAME/DEC];
+  for( uint32_t i = 0; i < TFRAME/DEC; ++i ) amp[i] = cabsf(dab->frame[i*DEC]);
+  float signalSum = 0;
+  float noiseSum = 0;
+  for( uint32_t i = 0; i < TNULL/DEC; ++i ) { // Null symbol = TNULL noise.
+    noiseSum += amp[i];
+  }
+  for( uint32_t i = TNULL/DEC; i < 3*TNULL/(2*DEC); ++i ) { // Signal after.
+    signalSum += amp[i];
+  }
+  const float noise = noiseSum / (TNULL/DEC);
+  const float signal = signalSum / (TNULL/2/DEC);
+  dab->snr = signal / noise;
+  dab->signalAmp = signal;
+  uint32_t bestIndex = 0;
+
+  // Slide the window :   A--signal--B__noise__C--signal--D   -->
+  for( uint32_t i = 3*TNULL/(2*DEC); i < TFRAME/DEC; ++i ) {
+    const float ampD = amp[i];
+    signalSum += ampD;
+    const float ampC = amp[i-TNULL/(2*DEC)];
+    signalSum -= ampC;
+    noiseSum += ampC;
+    const float ampB = amp[i-3*TNULL/(2*DEC)];
+    noiseSum -= ampB;
+    signalSum += ampB;
+    uint32_t signalSamples;
+    if( i*DEC >= 2*TNULL ) {
+      const float ampA = amp[i-2*TNULL/DEC];
+      signalSum -= ampA;
+      signalSamples = TNULL/DEC;
+    } else
+      signalSamples = i-TNULL/DEC;
+
+    // Calculate window S/N.
+    const float signal = signalSum / signalSamples;
+    const float noise =  noiseSum / (TNULL/DEC);
+    const float snr =  signal / noise;
+    if( snr > dab->snr ) { // Memorize best S/N and corresponding index.
+      dab->snr = snr;
+      dab->signalAmp = signal;
+      bestIndex = i*DEC - TNULL - TNULL/2;
+    }
+  }
+
+  // fprintf( stderr, "coarse_timeshift=%d\n", bestIndex );
+  if( dab->snr < HIGH_SNR || dab->signalAmp < WEAK_SIG ) {
+    dab->dt = 0;
+    return 0; // No null symbol detected.
+  } else if( bestIndex < TGUARD/2 && dab->force_timesync == 0 ) {
+    dab->dt = 0; // Keep time synchronization as is.
+    return -1;
   } else {
-    return ((maxPos-(1536))*2);
+    dab->dt = bestIndex; // Null symbol with good S/N found.
+    return -1;
   }
-  //return 0;
+
 }
 
-
-int32_t dab_coarse_freq_sync_2(fftw_complex * symbols){
-  int len = 128;
-  fftw_complex convoluted_prs[len];
-  int s;
-  int freq_hub = 14; // + and - center freq
-  int k;
-  float global_max = -99999;
-  int global_max_pos=0; 
-  for (k=-freq_hub;k<=freq_hub;k++) {
-    
-    for (s=0;s<len;s++) {
-      convoluted_prs[s][0] = prs_static[freq_hub+s][0]*symbols[freq_hub+k+256+s][0]-
-	(-1)*prs_static[freq_hub+s][1]*symbols[freq_hub+k+256+s][1];
-      convoluted_prs[s][1] = prs_static[freq_hub+s][0]*symbols[freq_hub+k+256+s][1]+
-	(-1)*prs_static[freq_hub+s][1]*symbols[freq_hub+k+256+s][0];
+/**
+ * Coarse frequency synchronization using the given TU carriers of the PRS FFT.
+ * Should be done AFTER fine time and frequency synchronization.
+ * Returns the PRS FFT spectrum shift in number of carriers (1kHz).
+ * Zero is expected for a centered spectrum i.e. with channels [-768 .. 768].
+ */
+int32_t dab_coarse_freq_sync( const fftwf_complex* prsFFT ) {
+  const int FREQ_HUB = 16; // +/-16kHz around the center frequency
+  float bestAmp = 0;
+  int32_t bestShift = 0;
+  for( int k = -FREQ_HUB; k <= FREQ_HUB; ++k ) {
+    float amp = cabsf(prsFFT[k-1+CARRIERS/2])
+	      + cabsf(prsFFT[k  +CARRIERS/2])
+      	      - cabsf(prsFFT[k+1+CARRIERS/2])
+      	      - cabsf(prsFFT[k+2+CARRIERS/2])
+	      - cabsf(prsFFT[k-2+TU-CARRIERS/2])
+	      - cabsf(prsFFT[k-1+TU-CARRIERS/2])
+	      + cabsf(prsFFT[k+  TU-CARRIERS/2])
+	      + cabsf(prsFFT[k+1+TU-CARRIERS/2]);
+    // fprintf( stderr, "fShift=%d x=%.1f\n", k, amp );
+    if( amp > bestAmp ) {
+      bestShift = k;
+      bestAmp = amp;
     }
-    fftw_complex convoluted_prs_time[len]; 
-    fftw_plan px;
-    px = fftw_plan_dft_1d(len, &convoluted_prs[0], &convoluted_prs_time[0], FFTW_BACKWARD, FFTW_ESTIMATE);
-    fftw_execute(px);
-    fftw_destroy_plan(px);
-    
-    
+  }
+  // fprintf( stderr, "bestShift=%d\n", bestShift );
+  return bestShift;
+}
+
+/**
+ * Fine frequency synchronization using the given TS samples in the time domain.
+ * Calculates the phase difference of the GUARD/2 samples before and after the
+ * TU symbol samples.
+ */
+float dab_fine_freq_sync( dab_state* dab, const fftwf_complex* symbol ) {
+  const uint32_t NSYNC = TGUARD - 32;	// Use not the whole guard for sync.
+  const fftwf_complex* p =		// Start of the guard used for sync.
+    symbol + TGUARD - NSYNC;
+  fftwf_complex mean = 0;
+  for( uint32_t i = 0; i < NSYNC; ++i ) {
+    mean += p[i] * conjf(p[i+TU]);
+  }
+  mean /= NSYNC;
+  const float angle = cargf( mean );
+  return -angle / ( 2 * M_PI ) * 1000;
+}
+
+/**
+ * Phase reference symbol (PRS) correlation in the frequency domain.
+ * Returns the synchronized PRS transformed to the frequency domain.
+ * e.g. J.Cho "PC-based receiver for Eureka-147" 2001
+ * e.g. K.Taura "A DAB receiver" 1996
+ */
+int8_t dab_fine_sync( dab_state* dab, fftwf_complex* prsFFT ) {
+  fftwf_complex* prsCorr = fftwf_alloc_complex(TU); // Aligned malloc for SIMD.
+  gnuplot( "frame.gp", TNULL+2*TS, dab->frame ); // First 3 symbols only
+
+  // Correct frequency with dt estimated from prior frames.
+  correctFrequency( dab, dab->df, TU, &dab->frame[TNULL+TGUARD/2+dab->dt], prsFFT );
+  gnuplot( "prs.gp", TS, &dab->frame[TNULL] );
+
+  //---------------------------------------------------------------------------
+  // 1) Fine time synchronization by correlation of the PRS with the reference.
+  //---------------------------------------------------------------------------
+  fft( TU, prsFFT, prsFFT );
+  int32_t dfCoarse = dab_coarse_freq_sync( prsFFT ); // To center FFT.
+  gnuplot( "prs_fft.gp", TU, prsFFT );
+  for( uint32_t k = 0; k < TU; ++k ) // Correlation = product of FFT's
+    prsCorr[k] = prsFFT[(k+dfCoarse)%TU] * conjf(prs_ref[k]);
+  gnuplot( "prs_corr_fft.gp", TU, prsCorr );
+  fftInv( TU, prsCorr, prsCorr );
+  gnuplot( "prs_corr.gp", TU, prsCorr );
+  int32_t peakIndex = peakAmpIndex( TU, prsCorr );
+  if( peakIndex >= TU/2 ) peakIndex -= TU;
+  dab->dt = peakIndex - TGUARD/2; // Synchronize with ref before guard of PRS.
+  // fprintf( stderr, "dt=%d\n", dab->dt );
+
+  //---------------------------------------------------------------------------
+  // 2) Fine frequency sync (must be done before coarse frequency sync).
+  //---------------------------------------------------------------------------
+  dab->df = dab_fine_freq_sync( dab, &dab->frame[TNULL+dab->dt] );
+  correctFrequency( dab, dab->df, TU, &dab->frame[TNULL+TGUARD/2+dab->dt], prsFFT );
+
+  //---------------------------------------------------------------------------
+  // 3) Coarse frequency sync in units of one carrier = 1kHz.
+  //---------------------------------------------------------------------------
+  fft( TU, prsFFT, prsFFT );
+  dfCoarse = dab_coarse_freq_sync( prsFFT );
+  dab->df += dfCoarse * 1000.0f;
+  if( dfCoarse ) { // Correct the PRS again using the corrected df.
+    correctFrequency( dab, dab->df, TU, &dab->frame[TNULL+TGUARD/2+dab->dt], prsFFT );
+    fft( TU, prsFFT, prsFFT );
+  }
+
+  // fprintf( stderr, "df=%d kHz\n", dfCoarse );
+
+  //---------------------------------------------------------------------------
+  // 4) Check PRS for correct time and frequency synchronization.
+  //---------------------------------------------------------------------------
 #if dbg
-    FILE *fh0;
-    fh0 = fopen("convoluted_prs_coarse.dat","w+");
-    for(s=0;s<len;s++) {
-      fprintf(fh0,"%f\n",(convoluted_prs_time[s][0]));
-      fprintf(fh0,"%f\n",(convoluted_prs_time[s][1]));
-    }
-    fclose(fh0);
+  fftwf_complex* prsTS = fftwf_alloc_complex(TS); // Aligned malloc for SIMD.
+  correctFrequency( dab, dab->df, TS, &dab->frame[TNULL+dab->dt], prsTS );
+  const float dfFine = dab_fine_freq_sync( dab, prsTS );
+  fft( TU, prsTS + TGUARD/2, prsCorr );
+  dfCoarse = dab_coarse_freq_sync( prsCorr );
+  if( dfCoarse )
+    fprintf( stderr, "Coarse frequency synchronization failed\n" );
+  for( uint32_t k = 0; k < TU; ++k ) {
+    prsCorr[k] *= conjf(prs_ref[k]);
+  }
+  gnuplot( "check_prs_corr_fft.gp", TU, prsCorr );
+  fftInv( TU, prsCorr, prsCorr );
+  gnuplot( "check_prs_corr.gp", TU, prsCorr );
+  int32_t dt = peakAmpIndex( TU, prsCorr );
+  if( dt >= TU/2 ) dt -= TU;
+  dt -= TGUARD/2;
+  const float df = dfFine + 1000.0f * dfCoarse;
+  if( abs(dt) > 1 || fabsf(df) > 1.0f )
+    fprintf( stderr, "sync check   dt=%d   df=%.1f\n", dt, df );
+  fftwf_free(prsTS);
 #endif
-    
-    uint32_t maxPos=0;
-    float tempVal = 0;
-    float maxVal=-99999;
-    for (s=0;s<len;s++) {
-      tempVal = sqrt((convoluted_prs_time[s][0]*convoluted_prs_time[s][0])+(convoluted_prs_time[s][1]*convoluted_prs_time[s][1]));
-      if (tempVal>maxVal) {
-	maxPos = s;
-	maxVal = tempVal;
-      }
-    }
-    //fprintf(stderr,"%f ",maxVal);
-    
-    
-    if (maxVal>global_max) {
-      global_max = maxVal;
-      global_max_pos = k;
-    }
-  }
-  //fprintf(stderr,"MAXPOS %d\n",global_max_pos);
-  return global_max_pos;
-}
-double dab_fine_freq_corr(fftw_complex * dab_frame,int32_t fine_timeshift){
-  fftw_complex *left;
-  fftw_complex *right;
-  fftw_complex *lr;
-  double angle[504];
-  double mean=0;
-  double ffs;
-  left = fftw_malloc(sizeof(fftw_complex) * 504);
-  right = fftw_malloc(sizeof(fftw_complex) * 504);
-  lr = fftw_malloc(sizeof(fftw_complex) * 504);
-  uint32_t i;
-  fine_timeshift = 0;
-  for (i=0;i<504;i++) {
-    left[i][0] = dab_frame[2656+2048+i+fine_timeshift][0];
-    left[i][1] = dab_frame[2656+2048+i+fine_timeshift][1];
-    right[i][0] = dab_frame[2656+i+fine_timeshift][0];
-    right[i][1] = dab_frame[2656+i+fine_timeshift][1];
-  }
-  for (i=0;i<504;i++){
-    lr[i][0] = (left[i][0]*right[i][0]-left[i][1]*(-1)*right[i][1]);
-    lr[i][1] = (left[i][0]*(-1)*right[i][1]+left[i][1]*right[i][0]);
-  }
-  
-  for (i=0;i<504;i++){
-   angle[i] = atan2(lr[i][1],lr[i][0]);
-  }
-  for (i=0;i<504;i++){
-    mean = mean + angle[i];
-  }
-  mean = (mean/504);
-  //printf("\n%f %f\n",left[0][0],left[0][1]);
-  //printf("\n%f %f\n",right[0][0],right[0][1]);
-  //printf("\n%f %f\n",lr[0][0],lr[0][1]);
-  //printf("\n%f\n",angle[0]);
 
-  ffs = mean / (2 * M_PI) * 1000;
-  //printf("\n%f\n",ffs);
-
-  fftw_free(left);
-  fftw_free(right);
-  fftw_free(lr);
-    
- return ffs;
+  fftwf_free(prsCorr);
+  return -1; // success
 }

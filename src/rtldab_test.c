@@ -1,11 +1,11 @@
 /*
 This file is part of rtl-dab
-trl-dab is free software: you can redistribute it and/or modify
+rtl-dab is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-Foobar is distributed in the hope that it will be useful,
+rtl-dab is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
@@ -16,6 +16,10 @@ along with rtl-dab.  If not, see <http://www.gnu.org/licenses/>.
 
 david may 2012
 david.may.muc@googlemail.com
+
+Jörg Siegler 2017   dev dot js at web dot de
+  - read raw samples from stdin, usage :
+    'rtldab_test < rawSamples.dump' or 'cat rawSamples.dump | rtldab_test'
 
 */
 
@@ -31,29 +35,16 @@ david.may.muc@googlemail.com
 #include "dab_fic_parser.h"
 #include "dab_analyzer.h"
 
-
-
-
-int corr_counter;
-
 //ServiceInformation sinfo;
 Ensemble sinfo;
 Analyzer ana;
-
-
 dab_state dab;
 
 int main(void){
-  int i;
   int frequency = 222055000;
   
   // open static file
-  FILE *fh;
-  fh = fopen("./222055_dump.dump", "r");
-  if (!fh) {
-      fprintf(stderr, "Cannot open file\n");
-      return 1;
-  }
+  FILE* fh = stdin;
 
   // init demodulator structure
   dab_demod_init(&dab);
@@ -64,16 +55,16 @@ int main(void){
   // init DAB Analyzer
   dab_analyzer_init(&ana);
 
-  // fill buffer and let the autogain settle
-  for (i=0;i<20;i++) {
-  fread(dab.input_buffer,1,16*16384,fh);
-  dab.input_buffer_len = 16*16384;
-  }
-  
-  for (i=0;i<100;i++) {
+  uint8_t buffer[16*16384];
+  while( 1 ) {
+
     // read next dab frame
-    fread(dab.input_buffer,1,16*16384,fh);
-    dab.input_buffer_len = 16*16384;
+    if( dab.fifo.count < 3*196608 ) {
+      uint32_t len = fread( buffer, 1, 16*16384, fh );
+      if( len <= 0 ) break;
+      cbWrite( &dab.fifo, buffer, len );
+    }
+
     // demodulate frame
     dab_demod(&dab);
     
@@ -83,14 +74,6 @@ int main(void){
     // calculate error rates
     dab_analyzer_calculate_error_rates(&ana,&dab);
 
-    //  correct frequency shift
-    if (abs(dab.fine_freq_shift) > 20 || abs(dab.coarse_freq_shift) > 1) {
-      corr_counter++;
-      corr_counter = 0 ;
-      frequency = frequency - dab.fine_freq_shift;// + dab2->coarse_freq_shift*1000;
-      //fprintf(stderr,"cfs : %i\n",dab.coarse_freq_shift);
-      //fprintf(stderr,"ffs : %f\n",dab.fine_freq_shift);
-    }
   } 
   
   fprintf(stderr,"ENSEMBLE STATUS:                                 \n");
@@ -120,13 +103,11 @@ int main(void){
     psl = psl->next;
   }
 
-
   fprintf(stderr,"Analyzer: \n");
   fprintf(stderr,"received fibs: %i\n",ana.received_fibs);
   fprintf(stderr,"faulty   fibs: %i\n",ana.faulty_fibs);
   fprintf(stderr,"faulty fib rate: %f\n",(float)ana.faulty_fibs/(float)ana.received_fibs);
   fprintf(stderr,"mean channel ber: %f\n",ana.mean_ber);
-
 
   return 1;
 }

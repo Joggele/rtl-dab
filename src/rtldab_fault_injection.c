@@ -1,11 +1,11 @@
 /*
 This file is part of rtl-dab
-trl-dab is free software: you can redistribute it and/or modify
+rtl-dab is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-Foobar is distributed in the hope that it will be useful,
+rtl-dab is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
@@ -77,15 +77,18 @@ int main(int argc, char **argv){
 
 
   // fill buffer and let the autogain settle
+  uint8_t buffer[16*16384];
   for (i=0;i<20;i++) {
-  fread(dab.input_buffer,1,16*16384,fh);
-  dab.input_buffer_len = 16*16384;
+    unsigned int len = fread( buffer, 1, 16*16384, fh );
+    cbWrite( &dab.fifo, buffer, len );
   }
   
   for (i=0;i<100;i++) {
+
     // read next dab frame
-    fread(dab.input_buffer,1,16*16384,fh);
-    dab.input_buffer_len = 16*16384;
+    unsigned int len = fread( buffer, 1, 16*16384, fh );
+    cbWrite( &dab.fifo, buffer, len );
+
     // demodulate frame
     dab_demod(&dab);
     

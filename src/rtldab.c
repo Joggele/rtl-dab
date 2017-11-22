@@ -1,11 +1,11 @@
 /*
 This file is part of rtl-dab
-trl-dab is free software: you can redistribute it and/or modify
+rtl-dab is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-Foobar is distributed in the hope that it will be useful,
+rtl-dab is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
@@ -16,6 +16,9 @@ along with rtl-dab.  If not, see <http://www.gnu.org/licenses/>.
 
 david may 2012
 david.may.muc@googlemail.com
+
+Jörg Siegler 2017   dev dot js at web dot de
+  - Hardware frequency sync replaced by a software frequency correction.
 
 */
 
@@ -46,10 +49,8 @@ Analyzer ana;
 void print_status(dab_state *dab) {
   fprintf(stderr,"RECEIVER STATUS:                                 \n");
   fprintf(stderr,"-------------------------------------------------\n");
-  fprintf(stderr,"cts : %i\n",dab->coarse_timeshift);
-  fprintf(stderr,"fts : %i\n",dab->fine_timeshift);
-  fprintf(stderr,"cfs : %i\n",dab->coarse_freq_shift);
-  fprintf(stderr,"ffs : %f\n",dab->fine_freq_shift);
+  fprintf(stderr,"dt  : %i\n",dab->dt);
+  fprintf(stderr,"df  : %f\n",dab->df);
   fprintf(stderr,"ENSEMBLE STATUS:                                 \n");
   fprintf(stderr,"-------------------------------------------------\n");
   fprintf(stderr,"locked: %u \n",sinfo.locked);
@@ -106,36 +107,6 @@ static void *demod_thread_fn(void *arg)
     dab_fic_parser(dab->fib,&sinfo,&ana);
     // calculate error rates
     dab_analyzer_calculate_error_rates(&ana,dab);
-
-    if (abs(dab->coarse_freq_shift)>1) {
-      if (dab->coarse_freq_shift<0)
-	dab->frequency = dab->frequency -1000;
-      else
-	dab->frequency = dab->frequency +1000;
-      
-      rtlsdr_set_center_freq(dev,dab->frequency);
-      
-    }
-    
-    if (abs(dab->coarse_freq_shift) ==1) {
-      
-      if (dab->coarse_freq_shift<0)
-	dab->frequency = dab->frequency -rand() % 1000;
-      else
-	dab->frequency = dab->frequency +rand() % 1000;
-      
-      rtlsdr_set_center_freq(dev,dab->frequency);
-      //fprintf(stderr,"new center freq : %i\n",rtlsdr_get_center_freq(dev));
-      
-    } 
-    if (abs(dab->coarse_freq_shift)<1 && (abs(dab->fine_freq_shift) > 50)) {
-      dab->frequency = dab->frequency + (dab->fine_freq_shift/3);
-      rtlsdr_set_center_freq(dev,dab->frequency);
-      //fprintf(stderr,"ffs : %f\n",dab->fine_freq_shift);
-
-    }
-    
-  
     
     ccount += 1;
     if (ccount == 10) {
@@ -155,8 +126,7 @@ static void rtlsdr_callback(uint8_t *buf, uint32_t len, void *ctx)
     return;}
   if (!ctx) {
     return;}
-  memcpy(dab->input_buffer,buf,len);
-  dab->input_buffer_len = len;
+  cbWrite( &dab->fifo, buf, len );
   sem_getvalue(&data_ready, &dr_val);
   if (!dr_val) {
     sem_post(&data_ready);}
